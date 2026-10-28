@@ -450,30 +450,36 @@ document.addEventListener('visibilitychange', () => {
 });
 
 // ===== ボタン =====
-$('start').addEventListener('click', async () => {
-  try {
-    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
-      // iPhone：許可ダイアログ。新しい Chrome もこの関数を持ち 'prompt' を返すことがあるので、
-      // はっきり拒否された（'denied'）ときだけ止める。
-      const res = await DeviceOrientationEvent.requestPermission();
-      if (res === 'denied') {
-        showWarn('センサーの使用が許可されませんでした。ページを再読み込みして、もう一度「測定を開始」を押してください。');
-        return;
-      }
-    }
-  } catch (e) {
-    showWarn('センサーの許可に失敗しました：' + e.message); return;
-  }
+$('start').addEventListener('click', () => {
+  if (started) return;
+  started = true;
+  // センサーの受信は先に始める（Android はこれだけで動く。許可待ちで止まらないように）
   window.addEventListener('deviceorientationabsolute', e => onOrientation(e, true));
   window.addEventListener('deviceorientation', e => onOrientation(e, false));
   startGeo();
   requestWakeLock();
-  started = true;
   $('start').style.display = 'none';
+  $('mainText').textContent = 'センサー待ち…';
+
+  // iPhone：許可ダイアログ（ボタンを押した直後に呼ぶ必要がある）。
+  // 新しい Chrome もこの関数を持ち、'prompt' を返したり応答しなかったりするので、
+  // はっきり拒否された（'denied'）ときだけ知らせる。
+  if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+    DeviceOrientationEvent.requestPermission()
+      .then(res => {
+        if (res === 'denied') showWarn('センサーの使用が許可されませんでした。iPhoneは Safari を完全に閉じて開き直し、もう一度「測定を開始」を押してください。');
+      })
+      .catch(() => {});
+  }
+
   setTimeout(() => {
-    if (!m) showWarn('センサーの値が届きません。https:// で始まるページで開いているか、端末にセンサーがあるか確認してください。');
-    else if (source === 'relative') showWarn('この端末・ブラウザでは北の方向が取得できません。傾斜は正しく出ますが、走向・方位は使えません。');
-  }, 3000);
+    if (!m) {
+      $('mainText').textContent = '---';
+      showWarn('センサーの値が届きません。Chrome の場合：アドレスバー左のアイコン →「権限」または「サイトの設定」で「モーションセンサー」を許可してから再読み込みしてください。');
+    } else if (source === 'relative') {
+      showWarn('この端末・ブラウザでは北の方向が取得できません。傾斜は正しく出ますが、走向・方位は使えません。');
+    }
+  }, 4000);
 });
 
 $('hold').addEventListener('click', () => {
