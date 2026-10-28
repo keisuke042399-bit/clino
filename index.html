@@ -1,0 +1,509 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>クリノメーター</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="icon" href="icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="クリノ">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="theme-color" content="#1F4E5F">
+<style>
+  :root {
+    --bg: #fdfbf6; --fg: #1e1e1e; --sub: #555; --accent: #1F4E5F;
+    --btn: #e4e0d6; --btn-fg: #1e1e1e; --warn-bg: #fff3cd; --warn-fg: #664d03;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #121416; --fg: #f0f0f0; --sub: #a8a8a8; --btn: #2c3034; --btn-fg: #f0f0f0; }
+  }
+  html, body { margin: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; -webkit-text-size-adjust: 100%; }
+  main { max-width: 520px; margin: 0 auto;
+    padding: calc(12px + env(safe-area-inset-top)) 16px calc(28px + env(safe-area-inset-bottom)); }
+  .center { text-align: center; }
+  #mainTitle { font-size: 13px; color: var(--sub); margin-top: 8px; }
+  #mainText { font-size: 44px; font-weight: 700; margin: 4px 0 2px; line-height: 1.15; }
+  #subText { font-size: 16px; color: var(--sub); min-height: 1.3em; }
+  canvas { display: block; width: 100%; }
+  #dial { margin-top: 16px; aspect-ratio: 1 / 1; }
+  #level { aspect-ratio: 2 / 1; margin: 12px 0; }
+  .line { font-size: 16px; margin: 6px 0; }
+  .small { font-size: 13px; color: var(--sub); }
+  .row { display: flex; gap: 8px; margin-top: 8px; }
+  button { flex: 1; font-size: 16px; padding: 13px 4px; border: none; border-radius: 10px;
+    background: var(--btn); color: var(--btn-fg); font-family: inherit; touch-action: manipulation; }
+  button.primary { background: var(--accent); color: #fff; }
+  button:active { opacity: .7; }
+  #start { width: 100%; font-size: 18px; padding: 16px; }
+  #warn { background: var(--warn-bg); color: var(--warn-fg); border-radius: 8px; padding: 8px 10px;
+    font-size: 13px; margin-top: 8px; display: none; }
+  #log { font-size: 13px; white-space: pre-wrap; margin-top: 16px; font-family: ui-monospace, Menlo, monospace; }
+  .toast { position: fixed; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom)); transform: translateX(-50%);
+    background: #333; color: #fff; padding: 10px 16px; border-radius: 20px; font-size: 14px; opacity: 0;
+    transition: opacity .3s; pointer-events: none; max-width: 90%; text-align: center; }
+  .toast.show { opacity: .95; }
+</style>
+</head>
+<body>
+<main>
+  <button id="start" class="primary">測定を開始（センサーと位置情報を許可）</button>
+  <div id="warn"></div>
+
+  <div class="center" id="mainTitle">走向・傾斜（背面を面に当てて同時測定）</div>
+  <div class="center" id="mainText">---</div>
+  <div class="center" id="subText"></div>
+
+  <canvas id="dial"></canvas>
+  <div class="center line" id="azText"></div>
+  <div class="center line" id="pendText"></div>
+  <canvas id="level"></canvas>
+
+  <div class="center line small" id="locText">位置情報：未取得</div>
+  <div class="center line small" id="refText">磁北基準</div>
+
+  <div class="row"><button id="hold">HOLD</button><button id="save" class="primary">保存</button></div>
+  <div class="row"><button id="ref">基準: 磁北</button><button id="csv">CSV出力</button><button id="clear">全削除</button></div>
+  <div id="log">（記録なし）</div>
+</main>
+<div class="toast" id="toast"></div>
+
+<script>
+'use strict';
+/*
+ * クリノメーター（Web版）
+ * Android版と同じ計算：端末姿勢の回転行列（端末座標 → 東・北・上）の z 列 = 背面を当てた面の法線。
+ * 物理クリノと違い、背面を当てるだけで走向と傾斜を同時に求める。
+ * 文字盤は物理クリノと同じく E/W を逆に刻む（目盛りをそのまま読むと正しい方位になる）。
+ * 画面表示と記録の値は通常の（正しい）方位。
+ */
+
+// ===== 設定 =====
+const ALPHA = 0.1;          // 平滑化係数
+const LEVEL_TH = 1.0;       // 前後・左右ともこの角度未満なら「水平」
+const STORE_KEY = 'clino_records_v1';
+const DECL_KEY = 'clino_declination';
+const CSV_HEADER = 'no,datetime,lat,lon,loc_acc_m,strike,dip,dip_dir,notation,device_azimuth,pitch,roll,level,north_ref,declination,pendulum';
+
+// ===== 状態 =====
+let m = null;               // 平滑化した回転行列（行優先 3x3）
+let holding = false;
+let useTrue = false;
+let declDeg = readNumber(DECL_KEY, -7.5);
+let started = false;
+let source = 'none';        // 'absolute'（Android Chrome） | 'ios' | 'relative'（北が分からない）
+let headingOffset = null;   // iOS：相対 alpha を北基準に直すための補正
+let offC = 0, offS = 0;
+let loc = null;
+let drawPending = false;
+
+const $ = id => document.getElementById(id);
+const DEG = Math.PI / 180;
+const deg = r => r / DEG;
+const norm360 = a => ((a % 360) + 360) % 360;
+const clamp1 = v => Math.max(-1, Math.min(1, v));
+const az0 = v => String(Math.round(norm360(v)) % 360);          // 方位を整数に（360 → 0）
+const pad3 = v => az0(v).padStart(3, '0');
+const p2 = v => String(v).padStart(2, '0');
+
+function readNumber(key, def) {
+  try { const v = parseFloat(localStorage.getItem(key)); return isFinite(v) ? v : def; } catch (e) { return def; }
+}
+function toast(msg) {
+  const t = $('toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), 2400);
+}
+function showWarn(msg) { const w = $('warn'); w.textContent = msg; w.style.display = 'block'; }
+
+// ===== 姿勢 =====
+// W3C DeviceOrientation（Z-X'-Y''）の回転行列。行 = 東・北・上、列 = 端末の右・上端・画面の外向き。
+function rotMatrix(a, b, g) {
+  a *= DEG; b *= DEG; g *= DEG;
+  const cA = Math.cos(a), sA = Math.sin(a), cB = Math.cos(b), sB = Math.sin(b), cG = Math.cos(g), sG = Math.sin(g);
+  return [
+    cA * cG - sA * sB * sG, -cB * sA, cG * sA * sB + cA * sG,
+    cG * sA + cA * sB * sG,  cA * cB, sA * sG - cA * cG * sB,
+    -cB * sG,                sB,      cB * cG
+  ];
+}
+
+function updateOffset(target) {
+  const r = target * DEG;
+  if (headingOffset === null) { offC = Math.cos(r); offS = Math.sin(r); }
+  else { offC += 0.05 * (Math.cos(r) - offC); offS += 0.05 * (Math.sin(r) - offS); }
+  headingOffset = deg(Math.atan2(offS, offC));
+}
+
+function onOrientation(e, isAbsEvent) {
+  if (e.alpha == null || e.beta == null || e.gamma == null) return;
+  let alpha = e.alpha;
+  if (isAbsEvent) {
+    source = 'absolute';
+  } else {
+    if (source === 'absolute') return;                 // Android：絶対方位のイベントを優先
+    if (typeof e.webkitCompassHeading === 'number' && e.webkitCompassHeading >= 0) {
+      // iOS：alpha は起動時基準の相対値なので、コンパス方位との差を補正量として使う。
+      // 補正量は端末を寝かせ気味（画面が上向き）のときだけ更新する。
+      source = 'ios';
+      const zUp = Math.cos(e.beta * DEG) * Math.cos(e.gamma * DEG);
+      if (zUp > 0.5 || headingOffset === null) updateOffset((360 - e.webkitCompassHeading) - e.alpha);
+    } else if (e.absolute === true) {
+      source = 'absolute';
+    } else if (source !== 'ios') {
+      source = 'relative';
+    }
+    if (source === 'ios' && headingOffset !== null) alpha = e.alpha + headingOffset;
+  }
+  if (holding) return;
+  const r = rotMatrix(alpha, e.beta, e.gamma);
+  if (!m) m = r.slice();
+  else for (let i = 0; i < 9; i++) m[i] += ALPHA * (r[i] - m[i]);   // ベクトルで平滑化（0/360°の境目で壊れない）
+  scheduleDraw();
+}
+
+// ===== 計算（Android版と同じ） =====
+function unit(a, b, c) { const l = Math.hypot(a, b, c) || 1; return [a / l, b / l, c / l]; }
+
+function reading() {
+  const x = unit(m[0], m[3], m[6]);   // 端末の右方向
+  const y = unit(m[1], m[4], m[7]);   // 端末の上端方向
+  const z = unit(m[2], m[5], m[8]);   // 画面に垂直（＝当てた面の法線）
+  let [e, n, u] = z;
+  if (u < 0) { e = -e; n = -n; u = -u; }          // 法線を上向きにそろえる
+  const decl = useTrue ? declDeg : 0;
+  const dip = deg(Math.acos(clamp1(u)));
+  const dipDir = norm360(deg(Math.atan2(e, n)) + decl);
+  const strike = norm360(dipDir - 90);             // 右手則
+  const deviceAz = norm360(deg(Math.atan2(y[0], y[1])) + decl);
+  const pitch = deg(Math.asin(clamp1(y[2])));      // 前後（上端が上がると＋）
+  const roll = deg(Math.asin(clamp1(x[2])));       // 左右（右が上がると＋）
+  const level = Math.abs(pitch) < LEVEL_TH && Math.abs(roll) < LEVEL_TH;
+  const inPlane = Math.hypot(x[2], y[2]);
+  // 振り子は端末を立てたとき（画面がほぼ鉛直、傾き約30°以内）だけ有効
+  const pendulum = inPlane > 0.85 ? deg(Math.asin(clamp1(Math.abs(y[2]) / inPlane))) : null;
+  return { strike, dip, dipDir, deviceAz, pitch, roll, level,
+           northRef: useTrue ? 'true' : 'magnetic', decl, xUp: x[2], yUp: y[2], pendulum };
+}
+
+// ===== 表記 =====
+function strikeQuadrant(s, d) {
+  const a = Math.round(norm360(s)) % 180;
+  return a <= 90 ? `N${a}${d}E` : `N${180 - a}${d}W`;
+}
+function dirQuadrant(az) {
+  const a = Math.round(norm360(az)) % 360;
+  const exact = { 0: 'N', 90: 'E', 180: 'S', 270: 'W' }[a];   // ちょうど東西南北のときは1文字
+  if (exact) return exact;
+  return ((a > 270 || a < 90) ? 'N' : 'S') + (a < 180 ? 'E' : 'W');
+}
+function bearingQuadrant(az) {
+  const a = Math.round(norm360(az)) % 360;
+  if (a <= 90) return `N${a}°E`;
+  if (a <= 180) return `S${180 - a}°E`;
+  if (a <= 270) return `S${a - 180}°W`;
+  return `N${360 - a}°W`;
+}
+function notation(r, withDeg) {
+  if (r.dip < 1) return withDeg ? '水平（傾斜1°未満）' : 'horizontal';
+  const d = withDeg ? '°' : '';
+  return `${strikeQuadrant(r.strike, d)} ${Math.round(r.dip)}${d}${dirQuadrant(r.dipDir)}`;
+}
+
+// ===== 表示 =====
+function scheduleDraw() {
+  if (drawPending) return;
+  drawPending = true;
+  requestAnimationFrame(() => { drawPending = false; updateDisplay(); });
+}
+
+function updateDisplay() {
+  if (!m) { drawDial(null); drawLevel(null); return; }
+  const r = reading();
+  const north = source !== 'relative';
+  $('mainText').textContent = north ? notation(r, true) : `傾斜 ${Math.round(r.dip)}°`;
+  $('subText').textContent = north
+    ? `走向 ${pad3(r.strike)}° / 傾斜 ${Math.round(r.dip)}° / 傾斜方向 ${pad3(r.dipDir)}°`
+    : '方位が取得できないため走向は表示できません';
+  $('azText').textContent = north ? `針の読み（端末上端の向き）  ${bearingQuadrant(r.deviceAz)}  (${pad3(r.deviceAz)}°)` : '';
+  $('pendText').textContent = r.pendulum != null ? `振り子の読み  ${Math.round(r.pendulum)}°` : '振り子：端末を立てると表示';
+  $('refText').textContent = useTrue ? `真北基準（偏角 ${declDeg >= 0 ? '+' : ''}${declDeg.toFixed(1)}° で補正）` : '磁北基準';
+  drawDial(r);
+  drawLevel(r);
+}
+
+function updateLoc() {
+  if (!loc) return;
+  $('locText').textContent = `緯度 ${loc.lat.toFixed(6)}  経度 ${loc.lon.toFixed(6)}  (±${Math.round(loc.acc)}m)`;
+}
+
+// キャンバスを画面の解像度に合わせる
+function prepCanvas(cv) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
+    cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+  }
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  return { ctx, w, h };
+}
+const FONT = '-apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif';
+
+// クリノ式文字盤（N が端末上端、E/W は逆、象限式目盛り、振り子リング、磁針）
+function drawDial(r) {
+  const { ctx: c, w, h } = prepCanvas($('dial'));
+  const cx = w / 2, cy = h / 2, R = Math.min(cx, cy) * 0.95;
+  const px = (s, rr) => cx + rr * Math.sin(s * DEG);
+  const py = (s, rr) => cy - rr * Math.cos(s * DEG);
+
+  c.fillStyle = '#F5F0E1'; c.beginPath(); c.arc(cx, cy, R, 0, 2 * Math.PI); c.fill();
+  c.strokeStyle = '#000'; c.lineWidth = R * 0.015; c.stroke();
+
+  c.textAlign = 'center'; c.textBaseline = 'middle';
+  for (let s = 0; s < 360; s += 2) {
+    const major = s % 10 === 0;
+    c.strokeStyle = '#000'; c.lineWidth = major ? R * 0.008 : R * 0.004;
+    const len = major ? R * 0.1 : R * 0.05;
+    c.beginPath(); c.moveTo(px(s, R), py(s, R)); c.lineTo(px(s, R - len), py(s, R - len)); c.stroke();
+    if (major) {
+      const letter = { 0: 'N', 90: 'W', 180: 'S', 270: 'E' }[s];
+      let text;
+      if (letter) text = letter;
+      else {
+        const az = (360 - s) % 360;                         // 左回りに方位が増える＝E/W 逆
+        text = String(az <= 90 ? az : az <= 180 ? 180 - az : az <= 270 ? az - 180 : 360 - az);
+      }
+      const size = letter ? R * 0.12 : R * 0.06;
+      c.font = `${letter ? 600 : 400} ${size}px ${FONT}`;
+      c.fillStyle = s === 0 ? '#C81E1E' : '#000';
+      const tr = letter ? R * 0.76 : R * 0.81;
+      c.fillText(text, px(s, tr), py(s, tr));
+    }
+  }
+
+  // 振り子（傾斜計）の目盛り：左右 0°、上下 90°
+  const ri = R * 0.58;
+  c.strokeStyle = '#2846A0'; c.fillStyle = '#2846A0'; c.lineWidth = R * 0.005;
+  c.beginPath(); c.arc(cx, cy, ri, 0, 2 * Math.PI); c.stroke();
+  c.font = `${R * 0.05}px ${FONT}`;
+  for (let s = 0; s < 360; s += 10) {
+    const len = s % 30 === 0 ? R * 0.06 : R * 0.03;
+    c.beginPath(); c.moveTo(px(s, ri), py(s, ri)); c.lineTo(px(s, ri - len), py(s, ri - len)); c.stroke();
+    if (s % 30 === 0) c.fillText(String(Math.abs(90 - (s % 180))), px(s, ri - R * 0.1), py(s, ri - R * 0.1));
+  }
+  if (!r) return;
+
+  // 振り子：重力を画面の面内に投影した向き
+  const gx = -r.xUp, gy = r.yUp, mag = Math.hypot(gx, gy);
+  if (mag > 0.25) {
+    const k = ri * 0.95 / mag, ex = cx + gx * k, ey = cy + gy * k;
+    c.globalAlpha = Math.min(1, mag);
+    c.strokeStyle = '#2846C8'; c.fillStyle = '#2846C8'; c.lineWidth = R * 0.018;
+    c.beginPath(); c.moveTo(cx, cy); c.lineTo(ex, ey); c.stroke();
+    c.beginPath(); c.arc(ex, ey, R * 0.035, 0, 2 * Math.PI); c.fill();
+    c.globalAlpha = 1;
+  }
+
+  // 磁針（赤が北端）。方位が取れない端末では描かない
+  if (source === 'relative') return;
+  const nd = -r.deviceAz, nl = R * 0.68, nw = R * 0.05;
+  const tri = (tip, col) => {
+    c.beginPath(); c.moveTo(px(tip, nl), py(tip, nl));
+    c.lineTo(px(nd + 90, nw), py(nd + 90, nw)); c.lineTo(px(nd - 90, nw), py(nd - 90, nw));
+    c.closePath(); c.fillStyle = col; c.fill();
+  };
+  tri(nd, '#C81E1E'); tri(nd + 180, '#282828');
+  c.fillStyle = '#B4A05A'; c.beginPath(); c.arc(cx, cy, R * 0.03, 0, 2 * Math.PI); c.fill();
+}
+
+// 水準器（文字盤とは別に大きく表示）
+function drawLevel(r) {
+  const { ctx: c, w, h } = prepCanvas($('level'));
+  c.fillStyle = '#F5F0E1';
+  const rad = h * 0.08;
+  c.beginPath();
+  if (c.roundRect) c.roundRect(0, 0, w, h, rad); else c.rect(0, 0, w, h);
+  c.fill();
+
+  const R = h * 0.42, cx = h * 0.5, cy = h * 0.5, full = 5;
+  c.fillStyle = '#D7EBB9'; c.beginPath(); c.arc(cx, cy, R, 0, 2 * Math.PI); c.fill();
+  c.strokeStyle = '#444'; c.lineWidth = R * 0.03; c.stroke();
+  c.lineWidth = R * 0.015;
+  for (const d of [1, 3]) { c.beginPath(); c.arc(cx, cy, R * 0.85 * d / full, 0, 2 * Math.PI); c.stroke(); }
+  c.beginPath(); c.moveTo(cx - R, cy); c.lineTo(cx + R, cy); c.moveTo(cx, cy - R); c.lineTo(cx, cy + R); c.stroke();
+  if (!r) return;
+
+  const upright = Math.hypot(r.xUp, r.yUp) > 0.6;
+  let bx = r.roll / full, by = -r.pitch / full;
+  const len = Math.hypot(bx, by);
+  if (len > 1) { bx /= len; by /= len; }
+  const bpx = cx + bx * R * 0.85, bpy = cy + by * R * 0.85, br = R * 0.17;
+  c.fillStyle = upright ? '#C8C8C8' : r.level ? '#28AA46' : '#EB961E';
+  c.beginPath(); c.arc(bpx, bpy, br, 0, 2 * Math.PI); c.fill();
+  c.strokeStyle = '#444'; c.lineWidth = R * 0.02; c.stroke();
+
+  const tx = h * 1.02;
+  c.textAlign = 'left'; c.textBaseline = 'alphabetic';
+  c.font = `600 ${h * 0.14}px ${FONT}`;
+  c.fillStyle = upright ? '#888' : r.level ? '#1E8C3C' : '#C86E00';
+  c.fillText(upright ? '立てています' : r.level ? '● 水平' : '○ 傾いている', tx, h * 0.32);
+  c.fillStyle = '#1E1E1E'; c.font = `${h * 0.12}px ${FONT}`;
+  const sgn = v => (v >= 0 ? '+' : '') + v.toFixed(1);
+  c.fillText(`前後 ${sgn(r.pitch)}°`, tx, h * 0.58);
+  c.fillText(`左右 ${sgn(r.roll)}°`, tx, h * 0.80);
+}
+
+// ===== 記録 =====
+function loadRecords() {
+  try { return JSON.parse(localStorage.getItem(STORE_KEY) || '[]'); } catch (e) { return []; }
+}
+function storeRecords(a) {
+  try { localStorage.setItem(STORE_KEY, JSON.stringify(a)); return true; }
+  catch (e) { toast('保存に失敗しました（ブラウザの保存領域を確認してください）'); return false; }
+}
+function stamp(d, sep) {
+  return `${d.getFullYear()}${sep[0]}${p2(d.getMonth() + 1)}${sep[0]}${p2(d.getDate())}${sep[1]}` +
+         `${p2(d.getHours())}${sep[2]}${p2(d.getMinutes())}${sep[2]}${p2(d.getSeconds())}`;
+}
+
+function save() {
+  if (!m) { toast('センサーの値がまだありません'); return; }
+  const r = reading();
+  const recs = loadRecords();
+  const no = recs.length + 1;
+  const line = [
+    no, stamp(new Date(), ['-', ' ', ':']),
+    loc ? loc.lat.toFixed(6) : '', loc ? loc.lon.toFixed(6) : '', loc ? Math.round(loc.acc) : '',
+    az0(r.strike), Math.round(r.dip), az0(r.dipDir), notation(r, false), az0(r.deviceAz),
+    r.pitch.toFixed(1), r.roll.toFixed(1), r.level ? 1 : 0, r.northRef, r.decl.toFixed(1),
+    r.pendulum == null ? '' : Math.round(r.pendulum)
+  ].join(',');
+  recs.push(line);
+  if (storeRecords(recs)) { refreshLog(); toast(`#${no} を保存しました`); }
+}
+
+function refreshLog() {
+  const recs = loadRecords();
+  if (!recs.length) { $('log').textContent = '（記録なし）'; return; }
+  const lines = recs.slice().reverse().slice(0, 100).map(l => {
+    const c = l.split(',');
+    if (c.length < 15) return l;
+    const t = c[1].length >= 19 ? c[1].substring(11) : c[1];
+    const pos = c[2] ? `${c[2]}, ${c[3]}` : '位置なし';
+    return `#${c[0]} ${t}  ${c[8]}  方位${c[9]}°  [${pos}]`;
+  });
+  $('log').textContent = `記録 ${recs.length} 件（新しい順）\n` + lines.join('\n');
+}
+
+async function exportCsv() {
+  const recs = loadRecords();
+  if (!recs.length) { toast('記録がありません'); return; }
+  const text = CSV_HEADER + '\n' + recs.join('\n') + '\n';
+  const name = 'clino_' + stamp(new Date(), ['', '_', '']) + '.csv';
+  const file = new File([text], name, { type: 'text/csv' });
+  // iPhone・Android：共有メニュー（ファイルに保存、メール、ドライブ、LINE など）
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try { await navigator.share({ files: [file], title: name }); return; }
+    catch (e) { if (e.name === 'AbortError') return; }
+  }
+  // 共有できない環境：ダウンロード
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(file); a.download = name;
+  document.body.appendChild(a); a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  toast(`${name} をダウンロードしました`);
+}
+
+function clearAll() {
+  if (!confirm('全ての記録を削除しますか？（元に戻せません）')) return;
+  storeRecords([]); refreshLog();
+}
+
+// ===== 位置情報 =====
+function startGeo() {
+  if (!('geolocation' in navigator)) { $('locText').textContent = '位置情報：この端末では使えません'; return; }
+  $('locText').textContent = '位置情報を取得中…';
+  navigator.geolocation.watchPosition(p => {
+    const c = p.coords;
+    if (!loc || c.accuracy <= loc.acc || p.timestamp - loc.t > 10000) {
+      loc = { lat: c.latitude, lon: c.longitude, acc: c.accuracy, t: p.timestamp };
+      updateLoc();
+    }
+  }, err => {
+    $('locText').textContent = err.code === 1
+      ? '位置情報：許可されていません（端末の設定でこのサイトに許可してください）'
+      : '位置情報：取得できません（屋外で再度お試しください）';
+  }, { enableHighAccuracy: true, maximumAge: 5000, timeout: 30000 });
+}
+
+// ===== 画面を消さない =====
+let wakeLock = null;
+async function requestWakeLock() {
+  try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && started) requestWakeLock();
+});
+
+// ===== ボタン =====
+$('start').addEventListener('click', async () => {
+  try {
+    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+      // iPhone：許可ダイアログ。新しい Chrome もこの関数を持ち 'prompt' を返すことがあるので、
+      // はっきり拒否された（'denied'）ときだけ止める。
+      const res = await DeviceOrientationEvent.requestPermission();
+      if (res === 'denied') {
+        showWarn('センサーの使用が許可されませんでした。ページを再読み込みして、もう一度「測定を開始」を押してください。');
+        return;
+      }
+    }
+  } catch (e) {
+    showWarn('センサーの許可に失敗しました：' + e.message); return;
+  }
+  window.addEventListener('deviceorientationabsolute', e => onOrientation(e, true));
+  window.addEventListener('deviceorientation', e => onOrientation(e, false));
+  startGeo();
+  requestWakeLock();
+  started = true;
+  $('start').style.display = 'none';
+  setTimeout(() => {
+    if (!m) showWarn('センサーの値が届きません。https:// で始まるページで開いているか、端末にセンサーがあるか確認してください。');
+    else if (source === 'relative') showWarn('この端末・ブラウザでは北の方向が取得できません。傾斜は正しく出ますが、走向・方位は使えません。');
+  }, 3000);
+});
+
+$('hold').addEventListener('click', () => {
+  holding = !holding;
+  $('hold').textContent = holding ? 'RELEASE' : 'HOLD';
+});
+$('save').addEventListener('click', save);
+$('ref').addEventListener('click', () => {
+  if (!useTrue) {
+    const v = prompt('磁気偏角（度）を入力してください。\n西偏はマイナスです（関東付近は約 -7.5、九州は約 -6.5、北海道は約 -9）。', declDeg.toFixed(1));
+    if (v === null) return;
+    const d = parseFloat(v);
+    if (!isFinite(d) || Math.abs(d) > 30) { toast('数値を正しく入力してください'); return; }
+    declDeg = d;
+    try { localStorage.setItem(DECL_KEY, String(d)); } catch (e) {}
+  }
+  useTrue = !useTrue;
+  $('ref').textContent = useTrue ? '基準: 真北' : '基準: 磁北';
+  updateDisplay();
+});
+$('csv').addEventListener('click', exportCsv);
+$('clear').addEventListener('click', clearAll);
+
+window.addEventListener('resize', updateDisplay);
+refreshLog();
+updateDisplay();
+if (!window.isSecureContext) showWarn('このページは https:// で開いてください。http では センサー・位置情報が使えません。');
+
+// オフラインでも使えるように（山の中など）
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+</script>
+</body>
+</html>
