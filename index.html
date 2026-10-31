@@ -83,10 +83,14 @@
 
 // ===== 設定 =====
 const ALPHA = 0.1;          // 平滑化係数
-const LEVEL_TH = 1.0;       // 前後・左右ともこの角度未満なら「水平」
+const LEVEL_TH = 2.0;       // 前後・左右ともこの角度未満なら「水平」（物理クリノの円形水準器程度）
+const LEVEL_OFF = 2.5;      // いったん水平になったら、この角度を超えるまで「水平」のまま（表示のちらつき防止）
+const LEVEL_FULL = 10;      // 水準器の泡がこの角度で縁に届く
+const CLINO_ZONE = 6;       // 端末の傾きがこれ未満なら「クリノ式の走向測定（水平にして長辺を当てる）」とみなす
+let wasLevel = false;
 const STORE_KEY = 'clino_records_v1';
 const DECL_KEY = 'clino_declination';
-const CSV_HEADER = 'no,datetime,lat,lon,loc_acc_m,strike,dip,dip_dir,notation,device_azimuth,pitch,roll,level,north_ref,declination,pendulum';
+const CSV_HEADER = 'no,datetime,lat,lon,loc_acc_m,strike,dip,dip_dir,notation,device_azimuth,pitch,roll,level,north_ref,declination,pendulum,mode';
 
 // ===== 状態 =====
 let m = null;               // 平滑化した回転行列（行優先 3x3）
@@ -180,11 +184,17 @@ function reading() {
   const deviceAz = norm360(deg(Math.atan2(y[0], y[1])) + decl);
   const pitch = deg(Math.asin(clamp1(y[2])));      // 前後（上端が上がると＋）
   const roll = deg(Math.asin(clamp1(x[2])));       // 左右（右が上がると＋）
-  const level = Math.abs(pitch) < LEVEL_TH && Math.abs(roll) < LEVEL_TH;
+  const tilt = Math.max(Math.abs(pitch), Math.abs(roll));
+  const level = tilt < (wasLevel ? LEVEL_OFF : LEVEL_TH);
+  wasLevel = level;
+  // 端末がほぼ水平 → 背面の面はほぼ水平で、その走向は少しの傾きで大きく振れて意味を持たない。
+  // このときはクリノ式（長辺を面に当てて水平にする）とみなし、走向は長辺の向き＝針の読みから出す。
+  const clinoMode = dip < CLINO_ZONE;
+  const clinoStrike = deviceAz % 180;                // 走向は線なので 0〜180°
   const inPlane = Math.hypot(x[2], y[2]);
   // 振り子は端末を立てたとき（画面がほぼ鉛直、傾き約30°以内）だけ有効
   const pendulum = inPlane > 0.85 ? deg(Math.asin(clamp1(Math.abs(y[2]) / inPlane))) : null;
-  return { strike, dip, dipDir, deviceAz, pitch, roll, level,
+  return { strike, dip, dipDir, deviceAz, pitch, roll, level, clinoMode, clinoStrike,
            northRef: useTrue ? 'true' : 'magnetic', decl, xUp: x[2], yUp: y[2], pendulum };
 }
 
@@ -207,8 +217,9 @@ function bearingQuadrant(az) {
   return `N${360 - a}°W`;
 }
 function notation(r, withDeg) {
-  if (r.dip < 1) return withDeg ? '水平（傾斜1°未満）' : 'horizontal';
   const d = withDeg ? '°' : '';
+  if (r.clinoMode) return strikeQuadrant(r.clinoStrike, d);   // クリノ式：走向のみ
+  if (r.dip < 1) return withDeg ? '水平（傾斜1°未満）' : 'horizontal';
   return `${strikeQuadrant(r.strike, d)} ${Math.round(r.dip)}${d}${dirQuadrant(r.dipDir)}`;
 }
 
@@ -223,10 +234,22 @@ function updateDisplay() {
   if (!m) { drawDial(null); drawLevel(null); return; }
   const r = reading();
   const north = source !== 'relative';
-  $('mainText').textContent = north ? notation(r, true) : `傾斜 ${Math.round(r.dip)}°`;
-  $('subText').textContent = north
-    ? `走向 ${pad3(r.strike)}° / 傾斜 ${Math.round(r.dip)}° / 傾斜方向 ${pad3(r.dipDir)}°`
-    : '方位が取得できないため走向は表示できません';
+  if (north && r.clinoMode) {
+    // クリノ式の走向測定（端末をほぼ水平に寝かせている）
+    $('mainTitle').textContent = '走向（クリノ式：スマホを水平にして長辺を面に当てる）';
+    $('mainText').textContent = '走向 ' + notation(r, true);
+    $('mainText').style.opacity = r.level ? '1' : '0.45';
+    $('subText').textContent = r.level
+      ? `● 水平：この値を読み取れます（走向 ${pad3(r.clinoStrike)}°）`
+      : '水準器の泡を中央へ（水平にすると確定）';
+  } else {
+    $('mainTitle').textContent = '走向・傾斜（背面を面に当てて同時測定）';
+    $('mainText').style.opacity = '1';
+    $('mainText').textContent = north ? notation(r, true) : `傾斜 ${Math.round(r.dip)}°`;
+    $('subText').textContent = north
+      ? `走向 ${pad3(r.strike)}° / 傾斜 ${Math.round(r.dip)}° / 傾斜方向 ${pad3(r.dipDir)}°`
+      : '方位が取得できないため走向は表示できません';
+  }
   $('azText').textContent = north ? `針の読み（端末上端の向き）  ${bearingQuadrant(r.deviceAz)}  (${pad3(r.deviceAz)}°)` : '';
   $('pendText').textContent = r.pendulum != null ? `振り子の読み  ${Math.round(r.pendulum)}°` : '振り子：端末を立てると表示';
   $('refText').textContent = useTrue ? `真北基準（偏角 ${declDeg >= 0 ? '+' : ''}${declDeg.toFixed(1)}° で補正）` : '磁北基準';
@@ -329,11 +352,12 @@ function drawLevel(r) {
   if (c.roundRect) c.roundRect(0, 0, w, h, rad); else c.rect(0, 0, w, h);
   c.fill();
 
-  const R = h * 0.42, cx = h * 0.5, cy = h * 0.5, full = 5;
+  const R = h * 0.42, cx = h * 0.5, cy = h * 0.5, full = LEVEL_FULL;
   c.fillStyle = '#D7EBB9'; c.beginPath(); c.arc(cx, cy, R, 0, 2 * Math.PI); c.fill();
   c.strokeStyle = '#444'; c.lineWidth = R * 0.03; c.stroke();
   c.lineWidth = R * 0.015;
-  for (const d of [1, 3]) { c.beginPath(); c.arc(cx, cy, R * 0.85 * d / full, 0, 2 * Math.PI); c.stroke(); }
+  // 内側の円＝水平の範囲（2°）、外側＝5°
+  for (const d of [LEVEL_TH, 5]) { c.beginPath(); c.arc(cx, cy, R * 0.85 * d / full, 0, 2 * Math.PI); c.stroke(); }
   c.beginPath(); c.moveTo(cx - R, cy); c.lineTo(cx + R, cy); c.moveTo(cx, cy - R); c.lineTo(cx, cy + R); c.stroke();
   if (!r) return;
 
@@ -378,9 +402,14 @@ function save() {
   const line = [
     no, stamp(new Date(), ['-', ' ', ':']),
     loc ? loc.lat.toFixed(6) : '', loc ? loc.lon.toFixed(6) : '', loc ? Math.round(loc.acc) : '',
-    az0(r.strike), Math.round(r.dip), az0(r.dipDir), notation(r, false), az0(r.deviceAz),
+    // クリノ式の走向測定では、走向（0〜180°の線）だけを記録し、傾斜・傾斜方向は空欄
+    r.clinoMode ? String(Math.round(r.clinoStrike) % 180) : az0(r.strike),
+    r.clinoMode ? '' : Math.round(r.dip),
+    r.clinoMode ? '' : az0(r.dipDir),
+    notation(r, false), az0(r.deviceAz),
     r.pitch.toFixed(1), r.roll.toFixed(1), r.level ? 1 : 0, r.northRef, r.decl.toFixed(1),
-    r.pendulum == null ? '' : Math.round(r.pendulum)
+    r.pendulum == null ? '' : Math.round(r.pendulum),
+    r.clinoMode ? 'clino_strike' : 'back'
   ].join(',');
   recs.push(line);
   if (storeRecords(recs)) { refreshLog(); toast(`#${no} を保存しました`); }
