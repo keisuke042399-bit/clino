@@ -53,7 +53,7 @@
   <button id="start" class="primary">測定を開始（センサーと位置情報を許可）</button>
   <div id="warn"></div>
 
-  <div class="center" id="mainTitle">走向・傾斜（背面を面に当てて同時測定）</div>
+  <div class="center" id="mainTitle">針の読み（端末上端の向き）</div>
   <div class="center" id="mainText">---</div>
   <div class="center" id="subText"></div>
 
@@ -234,23 +234,16 @@ function updateDisplay() {
   if (!m) { drawDial(null); drawLevel(null); return; }
   const r = reading();
   const north = source !== 'relative';
-  if (north && r.clinoMode) {
-    // クリノ式の走向測定（端末をほぼ水平に寝かせている）
-    $('mainTitle').textContent = '走向（クリノ式：スマホを水平にして長辺を面に当てる）';
-    $('mainText').textContent = '走向 ' + notation(r, true);
-    $('mainText').style.opacity = r.level ? '1' : '0.45';
-    $('subText').textContent = r.level
-      ? `● 水平：この値を読み取れます（走向 ${pad3(r.clinoStrike)}°）`
-      : '水準器の泡を中央へ（水平にすると確定）';
+  // 最上部は針の読み（端末上端＝長辺の向き）だけを大きく表示
+  $('mainTitle').textContent = '針の読み（端末上端の向き）';
+  if (north) {
+    $('mainText').textContent = bearingQuadrant(r.deviceAz);
+    $('subText').textContent = `方位角 ${pad3(r.deviceAz)}°` + (r.level ? '　● 水平' : '');
   } else {
-    $('mainTitle').textContent = '走向・傾斜（背面を面に当てて同時測定）';
-    $('mainText').style.opacity = '1';
-    $('mainText').textContent = north ? notation(r, true) : `傾斜 ${Math.round(r.dip)}°`;
-    $('subText').textContent = north
-      ? `走向 ${pad3(r.strike)}° / 傾斜 ${Math.round(r.dip)}° / 傾斜方向 ${pad3(r.dipDir)}°`
-      : '方位が取得できないため走向は表示できません';
+    $('mainText').textContent = '---';
+    $('subText').textContent = 'この端末では方位が取得できません';
   }
-  $('azText').textContent = north ? `針の読み（端末上端の向き）  ${bearingQuadrant(r.deviceAz)}  (${pad3(r.deviceAz)}°)` : '';
+  $('azText').textContent = '';
   $('pendText').textContent = r.pendulum != null ? `振り子の読み  ${Math.round(r.pendulum)}°` : '振り子：端末を立てると表示';
   $('refText').textContent = useTrue ? `真北基準（偏角 ${declDeg >= 0 ? '+' : ''}${declDeg.toFixed(1)}° で補正）` : '磁北基準';
   drawDial(r);
@@ -423,7 +416,8 @@ function refreshLog() {
     if (c.length < 15) return l;
     const t = c[1].length >= 19 ? c[1].substring(11) : c[1];
     const pos = c[2] ? `${c[2]}, ${c[3]}` : '位置なし';
-    return `#${c[0]} ${t}  ${c[8]}  方位${c[9]}°  [${pos}]`;
+    const pend = c[15] ? `  振り子${c[15]}°` : '';
+    return `#${c[0]} ${t}  針 ${bearingQuadrant(parseFloat(c[9]))}${pend}  [${pos}]`;
   });
   $('log').textContent = `記録 ${recs.length} 件（新しい順）\n` + lines.join('\n');
 }

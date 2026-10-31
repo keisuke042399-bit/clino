@@ -1,6 +1,6 @@
 // オフライン対応：一度開いたら、電波のない場所でも起動できるようにする。
 // 更新を反映しやすいよう、通信できるときは常に最新を取りに行く（ネットワーク優先）。
-const CACHE = 'clino-v3';
+const CACHE = 'clino-v4';
 const ASSETS = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png', './apple-touch-icon.png'];
 
 self.addEventListener('install', e => {
